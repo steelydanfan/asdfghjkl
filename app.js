@@ -21,9 +21,28 @@ const elLs3Bat = document.getElementById('valLs3Bat');
 const elGwBat = document.getElementById('valGwBat');
 
 let isFastRate = true;
-let client = null; // Global MQTT client instance
+let client = null;
 
-// --- Chart Setup (Dark Mode & Touch Zoom) ---
+// Raw numerical history for chart unit conversions
+let chartRawHistory = []; // Array of { time: string, value: number, unit: string }
+let targetChartUnit = "kN";
+
+// --- Unit Conversion Helpers ---
+function convertTension(val, fromUnit, toUnit) {
+  if (fromUnit === toUnit) return val;
+  
+  // First convert to kN (base value)
+  let valInKn = val;
+  if (fromUnit === 'kgf') valInKn = val / 101.9716;
+  else if (fromUnit === 'lbf') valInKn = val / 224.8089;
+
+  // Convert kN to target unit
+  if (toUnit === 'kgf') return valInKn * 101.9716;
+  if (toUnit === 'lbf') return valInKn * 224.8089;
+  return valInKn; // kN
+}
+
+// --- Chart Setup ---
 const ctx = document.getElementById('tensionChart').getContext('2d');
 const tensionChart = new Chart(ctx, {
   type: 'line',
@@ -56,31 +75,41 @@ const tensionChart = new Chart(ctx, {
 
 window.resetZoom = () => tensionChart.resetZoom();
 
-function updateChart(tensionString) {
-  const val = parseFloat(tensionString);
-  if (isNaN(val)) return;
+window.changeChartUnit = (newUnit) => {
+  targetChartUnit = newUnit;
+  rebuildChart();
+};
 
-  const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  tensionChart.data.labels.push(now);
-  tensionChart.data.datasets[0].data.push(val);
-
-  if (tensionChart.data.labels.length > 100) {
-    tensionChart.data.labels.shift();
-    tensionChart.data.datasets[0].data.shift();
-  }
+function rebuildChart() {
+  tensionChart.data.labels = chartRawHistory.map(item => item.time);
+  tensionChart.data.datasets[0].data = chartRawHistory.map(item => 
+    convertTension(item.value, item.unit, targetChartUnit)
+  );
   tensionChart.update('none');
 }
 
-// --- Authentication & MQTT Engine ---
+function updateChart(tensionValue, unitStr) {
+  if (isNaN(tensionValue)) return;
 
-// Check for saved credentials on app open
+  const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  
+  chartRawHistory.push({ time: now, value: tensionValue, unit: unitStr });
+
+  if (chartRawHistory.length > 100) {
+    chartRawHistory.shift();
+  }
+
+  rebuildChart();
+}
+
+// --- Authentication & MQTT Engine ---
 window.addEventListener('load', () => {
   const savedUser = localStorage.getItem('ls3_mqtt_user');
   const savedPass = localStorage.getItem('ls3_mqtt_pass');
   if (savedUser && savedPass) {
     document.getElementById('inputUser').value = savedUser;
     document.getElementById('inputPass').value = savedPass;
-    attemptLogin(); // Auto-login if previously saved
+    attemptLogin();
   }
 });
 
@@ -101,22 +130,18 @@ window.attemptLogin = function() {
     username: user,
     password: pass,
     clean: true,
-    reconnectPeriod: 0, // Disable auto-reconnect if password is wrong
+    reconnectPeriod: 0,
   };
 
-  if (client) {
-    client.end(); // Clear any stale connection
-  }
+  if (client) client.end();
 
   client = mqtt.connect(BROKER_URL, options);
 
   client.on('connect', () => {
-    // Auth Success
     document.getElementById('loginScreen').classList.add('hidden');
     localStorage.setItem('ls3_mqtt_user', user);
     localStorage.setItem('ls3_mqtt_pass', pass);
     
-    // Enable auto-reconnect now that auth is verified
     client.options.reconnectPeriod = 3000;
     
     statusDot.className = "w-3 h-3 rounded-full bg-emerald-500";
@@ -127,30 +152,63 @@ window.attemptLogin = function() {
   });
 
   client.on('error', (err) => {
-    // Auth Failed
-    console.error("MQTT Error (Auth Failed):", err);
+    console.error("MQTT Auth Failed:", err);
     btn.innerHTML = `<span>Connect to Broker</span>`;
     btn.disabled = false;
     errorMsg.classList.remove('hidden');
     client.end();
   });
 
-  client.on('message', (topic, message) => {
-    if (topic === TOPIC_UPLINK) {
-      try {
-        const payload = JSON.parse(message.toString());
-        if (payload.tension) {
-          elTension.innerHTML = `${payload.tension.replace(/[^\d.-]/g, '')} <span class="text-2xl font-normal text-slate-400">${payload.tension.replace(/[\d.-]/g, '').trim()}</span>`;
-          updateChart(payload.tension);
+client.on('message', (topic, message) => {
+  if (topic === TOPIC_UPLINK) {
+    try {
+      const payload = JSON.parse(message.toString());
+      
+      // 1. Process Current Tension
+      if (payload.tension) {
+        const rawTensionStr = String(payload.tension).trim(); // e.g., "0.00 kN"
+        const numVal = parseFloat(rawTensionStr);
+        
+        // Extract unit safely (e.g. "kN", "kgf", "lbf")
+        const unitMatch = rawTensionStr.match(/(kN|kgf|lbf)/i);
+        const unitStr = unitMatch ? unitMatch[0] : 'kN';
+
+        if (!isNaN(numVal)) {
+          // Format based on unit type (kN uses 2 decimals, kgf/lbf are rounded integers on the scale)
+          const decimals = (unitStr.toLowerCase() === 'kn') ? 2 : 0;
+          
+          elTension.innerHTML = `${numVal.toFixed(decimals)} <span class="text-2xl font-normal text-slate-400">${unitStr}</span>`;
+          updateChart(numVal, unitStr);
         }
-        elPeak.textContent = payload.peak_load || '--';
-        elLs3Bat.textContent = payload.battery || '--';
-        elGwBat.textContent = (payload.module_bat !== undefined) ? `${payload.module_bat}%` : '--';
-      } catch (e) {
-        console.error(e);
       }
+
+      // 2. Process Peak Load
+      if (payload.peak_load) {
+        const rawPeakStr = String(payload.peak_load).trim(); // e.g., "0.000 kN"
+        const numPeak = parseFloat(rawPeakStr);
+        
+        const peakUnitMatch = rawPeakStr.match(/(kN|kgf|lbf)/i);
+        const peakUnitStr = peakUnitMatch ? peakUnitMatch[0] : 'kN';
+
+        if (!isNaN(numPeak)) {
+          const peakDecimals = (peakUnitStr.toLowerCase() === 'kn') ? 3 : 0;
+          elPeak.textContent = `${numPeak.toFixed(peakDecimals)} ${peakUnitStr}`;
+        } else {
+          elPeak.textContent = payload.peak_load;
+        }
+      } else {
+        elPeak.textContent = '--';
+      }
+
+      // 3. Process Batteries
+      elLs3Bat.textContent = payload.battery || '--';
+      elGwBat.textContent = (payload.module_bat !== undefined) ? `${payload.module_bat}%` : '--';
+
+    } catch (e) {
+      console.error("Payload Parse Error:", e);
     }
-  });
+  }
+});
 
   client.on('offline', () => {
     statusDot.className = "w-3 h-3 rounded-full bg-red-500 animate-pulse";
@@ -162,9 +220,7 @@ window.attemptLogin = function() {
 window.logout = function() {
   localStorage.removeItem('ls3_mqtt_user');
   localStorage.removeItem('ls3_mqtt_pass');
-  if (client) {
-    client.end();
-  }
+  if (client) client.end();
   document.getElementById('loginScreen').classList.remove('hidden');
   document.getElementById('btnLogin').innerHTML = `<span>Connect to Broker</span>`;
   document.getElementById('btnLogin').disabled = false;
@@ -190,11 +246,5 @@ window.toggleRate = () => {
     sendCommand('F'); // Fast 40Hz
     btn.textContent = "Fast 40Hz";
     isFastRate = true;
-  }
-};
-
-window.confirmPowerOff = () => {
-  if (confirm("Turn off LineScale 3 hardware? You must physically restart the scale afterwards.")) {
-    sendCommand('O');
   }
 };
