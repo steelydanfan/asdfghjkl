@@ -23,9 +23,13 @@ const elGwBat = document.getElementById('valGwBat');
 let isFastRate = true;
 let client = null;
 
-// Raw numerical history for chart unit conversions
+// Tracking Variables
+let lastKnownUnit = 'kN';
 let chartRawHistory = []; // Array of { time: string, value: number, unit: string }
 let targetChartUnit = "kN";
+
+// Persist the highest peak in the browser's local storage (stored universally as kN)
+let frontendMaxPeakKn = parseFloat(localStorage.getItem('ls3_max_peak_kn')) || 0;
 
 // --- Unit Conversion Helpers ---
 function convertTension(val, fromUnit, toUnit) {
@@ -90,15 +94,9 @@ function rebuildChart() {
 
 function updateChart(tensionValue, unitStr) {
   if (isNaN(tensionValue)) return;
-
   const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  
   chartRawHistory.push({ time: now, value: tensionValue, unit: unitStr });
-
-  if (chartRawHistory.length > 100) {
-    chartRawHistory.shift();
-  }
-
+  if (chartRawHistory.length > 100) chartRawHistory.shift();
   rebuildChart();
 }
 
@@ -134,20 +132,17 @@ window.attemptLogin = function() {
   };
 
   if (client) client.end();
-
   client = mqtt.connect(BROKER_URL, options);
 
   client.on('connect', () => {
     document.getElementById('loginScreen').classList.add('hidden');
     localStorage.setItem('ls3_mqtt_user', user);
     localStorage.setItem('ls3_mqtt_pass', pass);
-    
     client.options.reconnectPeriod = 3000;
     
     statusDot.className = "w-3 h-3 rounded-full bg-emerald-500";
     statusText.textContent = "CONNECTED";
     statusText.className = "text-xs font-bold tracking-wider uppercase text-emerald-400";
-    
     client.subscribe(TOPIC_UPLINK);
   });
 
@@ -159,56 +154,72 @@ window.attemptLogin = function() {
     client.end();
   });
 
-client.on('message', (topic, message) => {
-  if (topic === TOPIC_UPLINK) {
-    try {
-      const payload = JSON.parse(message.toString());
-      
-      // 1. Process Current Tension
-      if (payload.tension) {
-        const rawTensionStr = String(payload.tension).trim(); // e.g., "0.00 kN"
-        const numVal = parseFloat(rawTensionStr);
+  client.on('message', (topic, message) => {
+    if (topic === TOPIC_UPLINK) {
+      try {
+        const payload = JSON.parse(message.toString());
         
-        // Extract unit safely (e.g. "kN", "kgf", "lbf")
-        const unitMatch = rawTensionStr.match(/(kN|kgf|lbf)/i);
-        const unitStr = unitMatch ? unitMatch[0] : 'kN';
-
-        if (!isNaN(numVal)) {
-          // Format based on unit type (kN uses 2 decimals, kgf/lbf are rounded integers on the scale)
-          const decimals = (unitStr.toLowerCase() === 'kn') ? 2 : 0;
+        // 1. Process Current Tension & Detect Scale Unit
+        if (payload.tension !== undefined) {
+          const rawTensionStr = String(payload.tension).trim();
+          const numVal = parseFloat(rawTensionStr);
           
-          elTension.innerHTML = `${numVal.toFixed(decimals)} <span class="text-2xl font-normal text-slate-400">${unitStr}</span>`;
-          updateChart(numVal, unitStr);
+          const unitMatch = rawTensionStr.match(/[a-zA-Z]+/);
+          if (unitMatch) {
+            const u = unitMatch[0].toLowerCase();
+            if (u === 'n' || u === 'kn') lastKnownUnit = 'kN';
+            else if (u === 'kg' || u === 'kgf' || u === 'g') lastKnownUnit = 'kgf';
+            else if (u === 'lbs' || u === 'lbf' || u === 'lb' || u === 'b') lastKnownUnit = 'lbf';
+          }
+
+          if (!isNaN(numVal)) {
+            const decimals = (lastKnownUnit === 'kN') ? 2 : 0;
+            elTension.innerHTML = `${numVal.toFixed(decimals)} <span class="text-2xl font-normal text-slate-400">${lastKnownUnit}</span>`;
+            updateChart(numVal, lastKnownUnit);
+          }
         }
-      }
 
-      // 2. Process Peak Load
-      if (payload.peak_load) {
-        const rawPeakStr = String(payload.peak_load).trim(); // e.g., "0.000 kN"
-        const numPeak = parseFloat(rawPeakStr);
-        
-        const peakUnitMatch = rawPeakStr.match(/(kN|kgf|lbf)/i);
-        const peakUnitStr = peakUnitMatch ? peakUnitMatch[0] : 'kN';
+        // 2. Process Peak Load & Store Universal High-Water Mark
+        if (payload.peak_load !== undefined) {
+          const rawPeakStr = String(payload.peak_load).trim();
+          const numPeak = parseFloat(rawPeakStr);
 
-        if (!isNaN(numPeak)) {
-          const peakDecimals = (peakUnitStr.toLowerCase() === 'kn') ? 3 : 0;
-          elPeak.textContent = `${numPeak.toFixed(peakDecimals)} ${peakUnitStr}`;
-        } else {
-          elPeak.textContent = payload.peak_load;
+          // Find out what unit the ESP32 sent this peak in
+          let incomingPeakUnit = 'kN';
+          const peakUnitMatch = rawPeakStr.match(/[a-zA-Z]+/);
+          if (peakUnitMatch) {
+            const u = peakUnitMatch[0].toLowerCase();
+            if (u === 'n' || u === 'kn') incomingPeakUnit = 'kN';
+            else if (u === 'kg' || u === 'kgf' || u === 'g') incomingPeakUnit = 'kgf';
+            else if (u === 'lbs' || u === 'lbf' || u === 'lb' || u === 'b') incomingPeakUnit = 'lbf';
+          }
+
+          if (!isNaN(numPeak)) {
+            // Convert the incoming peak to pure kN for a safe, universal comparison
+            const incomingPeakKn = convertTension(numPeak, incomingPeakUnit, 'kN');
+            
+            // If the ESP32 caught a higher spike, save it to browser storage
+            if (incomingPeakKn > frontendMaxPeakKn) {
+              frontendMaxPeakKn = incomingPeakKn;
+              localStorage.setItem('ls3_max_peak_kn', frontendMaxPeakKn);
+            }
+          }
         }
-      } else {
-        elPeak.textContent = '--';
+
+        // 3. Display the highest memorized peak, converted to the scale's current display unit
+        const displayPeak = convertTension(frontendMaxPeakKn, 'kN', lastKnownUnit);
+        const peakDecimals = (lastKnownUnit === 'kN') ? 3 : 0;
+        elPeak.textContent = `${displayPeak.toFixed(peakDecimals)} ${lastKnownUnit}`;
+
+        // 4. Process Batteries
+        elLs3Bat.textContent = payload.battery || '--';
+        elGwBat.textContent = (payload.module_bat !== undefined) ? `${payload.module_bat}%` : '--';
+
+      } catch (e) {
+        console.error("Payload Parse Error:", e);
       }
-
-      // 3. Process Batteries
-      elLs3Bat.textContent = payload.battery || '--';
-      elGwBat.textContent = (payload.module_bat !== undefined) ? `${payload.module_bat}%` : '--';
-
-    } catch (e) {
-      console.error("Payload Parse Error:", e);
     }
-  }
-});
+  });
 
   client.on('offline', () => {
     statusDot.className = "w-3 h-3 rounded-full bg-red-500 animate-pulse";
@@ -231,6 +242,17 @@ window.logout = function() {
 window.sendCommand = (cmdChar) => {
   if (client && client.connected) {
     client.publish(TOPIC_DOWNLINK, cmdChar, { qos: 1 });
+
+    // When "Clear Peak" is pressed, explicitly reset the browser's memorized peak
+    if (cmdChar === 'C') {
+      frontendMaxPeakKn = 0;
+      localStorage.removeItem('ls3_max_peak_kn');
+      
+      const peakDecimals = (lastKnownUnit === 'kN') ? 3 : 0;
+      elPeak.textContent = `0.${'0'.repeat(peakDecimals)} ${lastKnownUnit}`;
+      console.log("Local frontend peak memory cleared.");
+    }
+
   } else {
     alert("MQTT Offline. Please log in first.");
   }
@@ -239,11 +261,11 @@ window.sendCommand = (cmdChar) => {
 window.toggleRate = () => {
   const btn = document.getElementById('btnRate');
   if (isFastRate) {
-    sendCommand('S'); // Slow 10Hz
+    sendCommand('S');
     btn.textContent = "Slow 10Hz";
     isFastRate = false;
   } else {
-    sendCommand('F'); // Fast 40Hz
+    sendCommand('F');
     btn.textContent = "Fast 40Hz";
     isFastRate = true;
   }
